@@ -1,0 +1,155 @@
+{-# LANGUAGE OverloadedStrings, TypeFamilies, QuasiQuotes,
+             TemplateHaskell, GADTs, FlexibleContexts,
+             MultiParamTypeClasses, DeriveDataTypeable,
+             GeneralizedNewtypeDeriving, ViewPatterns #-}
+module Main where
+
+import Control.Applicative
+import Data.Text (Text)
+import Yesod
+import Data.Time (UTCTime, getCurrentTime)
+import Control.Monad.Logger (runStdoutLoggingT)
+import Database.Persist.Sqlite
+    ( ConnectionPool, SqlBackend, runSqlPool, runMigration
+    , createSqlitePool, runSqlPersistMPool, fromSqlKey
+    )
+
+data Sitio = Sitio { connPool :: ConnectionPool }
+
+share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
+Pessoa
+   nome Text
+   idade Int
+   salario Double
+   deptoid DepartamentoId
+   deriving Show
+
+Departamento
+   nome Text
+   sigla Text 2
+   deriving Show
+|]
+
+-- /pessoa/#PessoaId PessoaR GET
+mkYesod "Sitio" [parseRoutes|
+   / CadastroR GET POST
+   /listar ListarR GET
+   /pessoa/#PessoaId PessoaR GET
+   /autor AutorR GET
+   /depto DptoR GET POST
+|]
+
+instance YesodPersist Sitio where
+   type YesodPersistBackend Sitio = SqlBackend
+   runDB f = do
+       master <- getYesod
+       let pool = connPool master
+       runSqlPool f pool
+
+instance Yesod Sitio where
+
+type Form a = Html -> MForm Handler (FormResult a, Widget)
+
+instance RenderMessage Sitio FormMessage where
+    renderMessage _ _ = defaultFormMessage
+
+formDepto :: Form Departamento
+formDepto = renderDivs $ Departamento <$>
+             areq textField "Nome" Nothing <*>
+             areq textField "Sigla" Nothing 
+
+formPessoa :: Form Pessoa
+formPessoa = renderDivs $ Pessoa <$>
+             areq textField "Nome" Nothing <*>
+             areq intField "Idade" Nothing <*>
+             areq doubleField "Salario" Nothing <*>
+             areq (selectField dptos) "Depto" Nothing
+
+dptos = do
+        entities <- runDB $ selectList [] [Asc DepartamentoNome]
+        optionsPairs $ Prelude.map (\cat -> (departamentoNome $ entityVal cat, entityKey cat)) entities   
+
+-- http://lpaste.net/144005
+widgetForm :: Enctype -> Widget -> Widget
+widgetForm enctype widget = [whamlet|
+            <h1>
+                Cadastro de pessoas
+            <form method=post action=@{CadastroR} enctype=#{enctype}>
+                ^{widget}
+                <input type="submit" value="Cadastrar">
+|]
+
+widgetFormD :: Enctype -> Widget -> Widget
+widgetFormD enctype widget = [whamlet|
+            <h1>
+                Cadastro de Dptos
+            <form method=post action=@{DptoR} enctype=#{enctype}>
+                ^{widget}
+                <input type="submit" value="Cadastrar">
+|]
+
+getAutorR :: Handler Html
+getAutorR = defaultLayout [whamlet|
+   <h1> O AUTOR SOU EU
+|]
+
+ww :: Widget
+ww = toWidgetHead [hamlet|
+<link rel="author" href=@{AutorR} title="Sobre...">
+|]
+
+getDptoR :: Handler Html
+getDptoR = do
+         (widget, enctype) <- generateFormPost formDepto
+         defaultLayout $ (widgetFormD enctype widget) >> ww
+
+getCadastroR :: Handler Html
+getCadastroR = do
+             (widget, enctype) <- generateFormPost formPessoa
+             defaultLayout $ (widgetForm enctype widget) >> ww
+
+getPessoaR :: PessoaId -> Handler Html
+getPessoaR pid = do
+             pessoa <- runDB $ get404 pid 
+             defaultLayout [whamlet| 
+                 <h1> Seja bem-vindx #{pessoaNome pessoa}
+                 <p> Salario: #{pessoaSalario pessoa}
+                 <p> Idade: #{pessoaIdade pessoa}
+             |]
+
+getListarR :: Handler Html
+getListarR = do
+             listaP <- runDB $ selectList [] [Asc PessoaNome]
+             defaultLayout [whamlet|
+                 <h1> Pessoas cadastradas:
+                 $forall Entity pid pessoa <- listaP
+                     <a href=@{PessoaR pid}> #{pessoaNome pessoa} <br>
+             |]
+
+postCadastroR :: Handler Html
+postCadastroR = do
+                ((result, _), _) <- runFormPost formPessoa
+                case result of
+                    FormSuccess pessoa -> do
+                       runDB $ insert pessoa 
+                       defaultLayout [whamlet| 
+                           <h1> #{pessoaNome pessoa} Inseridx com sucesso. 
+                       |]
+                    _ -> redirect CadastroR
+
+postDptoR :: Handler Html
+postDptoR = do
+                ((result, _), _) <- runFormPost formDepto
+                case result of
+                    FormSuccess dpto -> do
+                       runDB $ insert dpto
+                       defaultLayout [whamlet|
+                           <h1> #{departamentoNome dpto} Inserido com sucesso. 
+                       |]
+                    _ -> redirect DptoR
+
+main::IO()
+main = do 
+       pool <- runStdoutLoggingT $ createSqlitePool "sitio.db3" 10 -- create a new pool
+       runSqlPersistMPool (runMigration migrateAll) pool
+       warp 8080 (Sitio pool) 
